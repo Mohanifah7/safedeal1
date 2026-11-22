@@ -1,3 +1,0 @@
-streamlit>=1.40,<2
-ccxt>=4.4,<5
-pandas>=2.2,<3
