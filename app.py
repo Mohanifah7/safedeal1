@@ -1,15 +1,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+from io import StringIO
 
 import ccxt
 import pandas as pd
 import streamlit as st
 
-# ==================================================
+
+# ============================================================
 # 1. CONFIGURATION
-# ==================================================
+# ============================================================
 
 st.set_page_config(
     page_title="Crypto AutoHedge Lab",
@@ -18,10 +20,17 @@ st.set_page_config(
 )
 
 STARTING_CASH = 10_000.00
-RISK_PER_TRADE = 0.02
+
+NORMAL_RISK = 0.02
+RECOVERY_RISK = 0.005
+DAILY_RECOVERY_TRIGGER = 0.04
+
 STOP_ATR_MULTIPLIER = 1.5
 TARGET_ATR_MULTIPLIER = 3.0
+TRAILING_ATR_MULTIPLIER = 1.5
+
 MAX_POSITION_ALLOCATION = 0.25
+MAX_OPEN_POSITIONS = 3
 PAPER_FEE_RATE = 0.001
 
 DEFAULT_SYMBOLS = [
@@ -33,31 +42,32 @@ DEFAULT_SYMBOLS = [
 EXCHANGES = ["okx", "kucoin", "kraken"]
 TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"]
 
-# ==================================================
+
+# ============================================================
 # 2. SESSION STATE
-# ==================================================
+# ============================================================
 
-if "cash" not in st.session_state:
-    st.session_state.cash = STARTING_CASH
+DEFAULT_STATE = {
+    "cash": STARTING_CASH,
+    "positions": {},
+    "position_meta": {},
+    "trades": [],
+    "processed_candles": {},
+    "auto_enabled": True,
+    "daily_date": None,
+    "daily_start_equity": None,
+    "recovery_mode": False,
+    "equity_history": [],
+}
 
-if "positions" not in st.session_state:
-    st.session_state.positions = {}
+for key, value in DEFAULT_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-if "position_meta" not in st.session_state:
-    st.session_state.position_meta = {}
 
-if "trades" not in st.session_state:
-    st.session_state.trades = []
-
-if "processed_candles" not in st.session_state:
-    st.session_state.processed_candles = {}
-
-if "auto_enabled" not in st.session_state:
-    st.session_state.auto_enabled = True
-
-# ==================================================
+# ============================================================
 # 3. EXCHANGE CONNECTION
-# ==================================================
+# ============================================================
 
 @st.cache_resource
 def get_exchange(name: str):
@@ -69,9 +79,9 @@ def get_exchange(name: str):
     })
 
 
-# ==================================================
-# 4. MARKET DATA AND INDICATORS
-# ==================================================
+# ============================================================
+# 4. MARKET DATA
+# ============================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_scanner_data(
@@ -106,9 +116,6 @@ def fetch_scanner_data(
                 ticker = client.fetch_ticker(symbol)
 
                 if not candles:
-                    symbol_errors.append(
-                        f"{exchange_name}: no candles returned"
-                    )
                     continue
 
                 frame = pd.DataFrame(
@@ -142,12 +149,9 @@ def fetch_scanner_data(
                 ).reset_index(drop=True)
 
                 if len(frame) < 55:
-                    symbol_errors.append(
-                        f"{exchange_name}: insufficient candle history"
-                    )
                     continue
 
-                # EMA 20 and EMA 50
+                # EMA indicators
                 frame["EMA20"] = frame["Close"].ewm(
                     span=20,
                     adjust=False,
@@ -160,6 +164,7 @@ def fetch_scanner_data(
 
                 # RSI 14
                 delta = frame["Close"].diff()
+
                 gains = delta.clip(lower=0)
                 losses = -delta.clip(upper=0)
 
@@ -175,12 +180,10 @@ def fetch_scanner_data(
                     min_periods=14,
                 ).mean()
 
-                relative_strength = (
-                    avg_gain / avg_loss.where(avg_loss != 0)
-                )
+                rs = avg_gain / avg_loss.where(avg_loss != 0)
 
-                frame["RSI14"] = (
-                    100 - (100 / (1 + relative_strength))
+                frame["RSI14"] = 100 - (
+                    100 / (1 + rs)
                 )
 
                 frame.loc[
@@ -211,23 +214,24 @@ def fetch_scanner_data(
                     min_periods=14,
                 ).mean()
 
-                # Average volume
                 frame["VolumeMA20"] = frame["Volume"].rolling(
-                    window=20,
+                    20,
                     min_periods=20,
                 ).mean()
 
-                last_price = ticker.get("last")
+                price = ticker.get("last")
 
-                if last_price is None:
-                    last_price = frame["Close"].iloc[-1]
+                if price is None:
+                    price = frame["Close"].iloc[-1]
 
-                if float(last_price) <= 0:
-                    raise ValueError("Invalid market price")
+                price = float(price)
+
+                if price <= 0:
+                    raise ValueError("Invalid ticker price")
 
                 output[symbol] = {
                     "frame": frame,
-                    "price": float(last_price),
+                    "price": price,
                     "change": float(
                         ticker.get("percentage") or 0
                     ),
@@ -242,9 +246,8 @@ def fetch_scanner_data(
 
             except Exception as exc:
                 symbol_errors.append(
-                    f"{exchange_name}: {str(exc)[:160]}"
+                    f"{exchange_name}: {str(exc)[:140]}"
                 )
-                continue
 
         if not found:
             errors[symbol] = " | ".join(symbol_errors)
@@ -252,15 +255,11 @@ def fetch_scanner_data(
     return output, errors
 
 
-# ==================================================
-# 5. SIGNAL ENGINE
-# ==================================================
+# ============================================================
+# 5. INDICATORS AND SIGNALS
+# ============================================================
 
 def get_closed_candle(frame):
-    """
-    Use the previous candle because the newest candle
-    may still be forming.
-    """
     if len(frame) < 2:
         return None
 
@@ -274,13 +273,8 @@ def get_entry_signal(frame):
         return False
 
     required = [
-        "Close",
-        "EMA20",
-        "EMA50",
-        "RSI14",
-        "ATR14",
-        "Volume",
-        "VolumeMA20",
+        "Close", "EMA20", "EMA50",
+        "RSI14", "ATR14", "Volume", "VolumeMA20",
     ]
 
     if candle[required].isna().any():
@@ -293,7 +287,6 @@ def get_entry_signal(frame):
     volume = float(candle["Volume"])
     average_volume = float(candle["VolumeMA20"])
 
-    # Aggressive long-entry conditions
     trend_ok = close > ema20 > ema50
     momentum_ok = 45 <= rsi <= 72
     volume_ok = (
@@ -326,26 +319,56 @@ def get_signal_label(frame):
     if close < ema20 < ema50:
         return "BEARISH WATCH"
 
-    if rsi > 72 or rsi < 30:
-        return "CAUTION"
+    if rsi > 72:
+        return "OVERBOUGHT CAUTION"
+
+    if rsi < 30:
+        return "OVERSOLD CAUTION"
 
     return "NEUTRAL"
 
 
-# ==================================================
+def confirmed_bearish_reversal(frame):
+    """
+    Require two completed candles to confirm deterioration.
+    A single temporary RSI dip is not an exit by itself.
+    """
+
+    if len(frame) < 4:
+        return False
+
+    candles = frame.iloc[-3:-1]
+
+    for _, candle in candles.iterrows():
+        required = ["Close", "EMA20", "EMA50"]
+
+        if candle[required].isna().any():
+            return False
+
+        if not (
+            float(candle["Close"])
+            < float(candle["EMA20"])
+            < float(candle["EMA50"])
+        ):
+            return False
+
+    return True
+
+
+# ============================================================
 # 6. ACCOUNT EQUITY
-# ==================================================
+# ============================================================
 
 def calculate_equity(market_data):
     position_value = 0.0
 
     for symbol, quantity in st.session_state.positions.items():
         data = market_data.get(symbol)
+        meta = st.session_state.position_meta.get(symbol, {})
 
         if data:
             price = data["price"]
         else:
-            meta = st.session_state.position_meta.get(symbol, {})
             price = meta.get("entry_price", 0.0)
 
         position_value += float(quantity) * float(price)
@@ -353,9 +376,47 @@ def calculate_equity(market_data):
     return float(st.session_state.cash) + position_value
 
 
-# ==================================================
-# 7. PAPER TRADE EXECUTION
-# ==================================================
+def update_daily_risk(market_data):
+    equity = calculate_equity(market_data)
+
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    if st.session_state.daily_date != today:
+
+        st.session_state.daily_date = today
+        st.session_state.daily_start_equity = equity
+        st.session_state.recovery_mode = False
+
+    if st.session_state.daily_start_equity is None:
+        st.session_state.daily_start_equity = equity
+
+    baseline = float(st.session_state.daily_start_equity)
+
+    if baseline <= 0:
+        return equity, 0.0, NORMAL_RISK
+
+    daily_change = equity - baseline
+    daily_pct = daily_change / baseline
+
+    if daily_pct <= -DAILY_RECOVERY_TRIGGER:
+        st.session_state.recovery_mode = True
+
+    # Recovery mode ends only when daily starting equity is recovered.
+    if st.session_state.recovery_mode and equity >= baseline:
+        st.session_state.recovery_mode = False
+
+    risk = (
+        RECOVERY_RISK
+        if st.session_state.recovery_mode
+        else NORMAL_RISK
+    )
+
+    return equity, daily_pct, risk
+
+
+# ============================================================
+# 7. TRADE RECORDS
+# ============================================================
 
 def record_trade(
     symbol,
@@ -364,9 +425,26 @@ def record_trade(
     price,
     fee,
     reason,
-    risk_amount=0.0,
+    meta=None,
+    net_pnl=None,
 ):
-    value = quantity * price
+    meta = meta or {}
+
+    entry_time = meta.get("entry_time")
+
+    holding_minutes = None
+
+    if entry_time:
+        try:
+            started = datetime.fromisoformat(entry_time)
+            now = datetime.now(timezone.utc)
+
+            holding_minutes = max(
+                0.0,
+                (now - started).total_seconds() / 60,
+            )
+        except Exception:
+            pass
 
     st.session_state.trades.insert(0, {
         "Time (UTC)": datetime.now(
@@ -376,37 +454,48 @@ def record_trade(
         "Side": side,
         "Quantity": quantity,
         "Price (USDT)": price,
-        "Value (USDT)": value,
+        "Value (USDT)": quantity * price,
         "Fee (USDT)": fee,
-        "Risk Budget (USDT)": risk_amount,
-        "Reason": reason,
+        "Net P/L (USDT)": net_pnl,
+        "Holding Minutes": holding_minutes,
+        "MFE (%)": meta.get("mfe_pct"),
+        "MAE (%)": meta.get("mae_pct"),
+        "Entry RSI": meta.get("entry_rsi"),
+        "Exit Reason": reason,
         "Mode": "PAPER",
     })
 
 
-def open_paper_position(symbol, data, candle):
+# ============================================================
+# 8. OPEN POSITION
+# ============================================================
+
+def open_paper_position(
+    symbol,
+    data,
+    candle,
+    risk_fraction,
+):
     price = float(data["price"])
     atr = float(candle["ATR14"])
 
-    if atr <= 0 or price <= 0:
+    if price <= 0 or atr <= 0:
         return False
 
     stop_distance = atr * STOP_ATR_MULTIPLIER
 
-    if stop_distance <= 0 or stop_distance >= price:
+    if stop_distance >= price:
         return False
 
     equity = calculate_equity({symbol: data})
-    risk_budget = equity * RISK_PER_TRADE
 
-    # Position quantity based on 2% risk budget
+    risk_budget = equity * risk_fraction
+
     risk_quantity = risk_budget / stop_distance
 
-    # Limit position size to 25% of account equity
     max_allocation = equity * MAX_POSITION_ALLOCATION
     allocation_quantity = max_allocation / price
 
-    # Include simulated entry fee in available cash
     cash_quantity = (
         st.session_state.cash
         / (price * (1 + PAPER_FEE_RATE))
@@ -428,8 +517,9 @@ def open_paper_position(symbol, data, candle):
         return False
 
     stop_price = price - stop_distance
-    target_price = price + (
-        atr * TARGET_ATR_MULTIPLIER
+
+    target_price = (
+        price + atr * TARGET_ATR_MULTIPLIER
     )
 
     st.session_state.cash -= notional + fee
@@ -443,28 +533,44 @@ def open_paper_position(symbol, data, candle):
     meta[symbol] = {
         "entry_price": price,
         "stop_price": stop_price,
+        "initial_stop_price": stop_price,
         "target_price": target_price,
         "entry_atr": atr,
         "risk_amount": risk_budget,
+        "entry_fee": fee,
         "entry_time": datetime.now(
             timezone.utc
         ).isoformat(timespec="seconds"),
+        "highest_price": price,
+        "lowest_price": price,
+        "mfe_pct": 0.0,
+        "mae_pct": 0.0,
+        "trailing_active": False,
+        "target_reached": False,
+        "entry_rsi": float(candle["RSI14"]),
+        "entry_ema20": float(candle["EMA20"]),
+        "entry_ema50": float(candle["EMA50"]),
+        "entry_signal": "Aggressive bullish trend",
     }
 
     st.session_state.position_meta = meta
 
     record_trade(
-        symbol=symbol,
-        side="BUY",
-        quantity=quantity,
-        price=price,
-        fee=fee,
-        reason="Automatic bullish entry",
-        risk_amount=risk_budget,
+        symbol,
+        "BUY",
+        quantity,
+        price,
+        fee,
+        "Automatic bullish entry",
+        meta[symbol],
     )
 
     return True
 
+
+# ============================================================
+# 9. CLOSE POSITION
+# ============================================================
 
 def close_paper_position(symbol, price, reason):
     positions = dict(st.session_state.positions)
@@ -474,42 +580,167 @@ def close_paper_position(symbol, price, reason):
     if quantity <= 0 or price <= 0:
         return False
 
+    meta = dict(
+        st.session_state.position_meta.get(symbol, {})
+    )
+
+    entry = float(meta.get("entry_price", price))
+
     proceeds = quantity * price
-    fee = proceeds * PAPER_FEE_RATE
+    exit_fee = proceeds * PAPER_FEE_RATE
 
-    st.session_state.cash += proceeds - fee
+    entry_fee = float(meta.get("entry_fee", 0.0))
 
-    meta = dict(st.session_state.position_meta)
-    meta.pop(symbol, None)
+    gross_pnl = (price - entry) * quantity
+
+    net_pnl = gross_pnl - entry_fee - exit_fee
+
+    st.session_state.cash += proceeds - exit_fee
 
     positions.pop(symbol, None)
 
+    position_meta = dict(st.session_state.position_meta)
+    position_meta.pop(symbol, None)
+
     st.session_state.positions = positions
-    st.session_state.position_meta = meta
+    st.session_state.position_meta = position_meta
 
     record_trade(
-        symbol=symbol,
-        side="SELL",
-        quantity=quantity,
-        price=price,
-        fee=fee,
-        reason=reason,
+        symbol,
+        "SELL",
+        quantity,
+        price,
+        exit_fee,
+        reason,
+        meta,
+        net_pnl,
     )
 
     return True
 
 
-# ==================================================
-# 8. AUTOMATIC ENTRY AND EXIT ENGINE
-# ==================================================
+# ============================================================
+# 10. ADAPTIVE POSITION MANAGEMENT
+# ============================================================
 
-def process_automatic_trades(market_data):
+def manage_position(symbol, data, candle):
+    quantity = float(
+        st.session_state.positions.get(symbol, 0.0)
+    )
+
+    if quantity <= 0:
+        return None
+
+    meta = dict(
+        st.session_state.position_meta.get(symbol, {})
+    )
+
+    # Old positions without metadata must be recovered manually.
+    required = [
+        "entry_price",
+        "stop_price",
+        "target_price",
+        "entry_atr",
+    ]
+
+    if any(meta.get(key) is None for key in required):
+        return "Position requires metadata recovery"
+
+    price = float(data["price"])
+    entry = float(meta["entry_price"])
+    entry_atr = float(meta["entry_atr"])
+
+    if entry <= 0 or entry_atr <= 0:
+        return "Invalid position metadata"
+
+    # Track maximum favourable and adverse price.
+    highest = max(
+        float(meta.get("highest_price", entry)),
+        price,
+    )
+
+    lowest = min(
+        float(meta.get("lowest_price", entry)),
+        price,
+    )
+
+    meta["highest_price"] = highest
+    meta["lowest_price"] = lowest
+
+    meta["mfe_pct"] = (
+        (highest - entry) / entry
+    ) * 100
+
+    meta["mae_pct"] = (
+        (lowest - entry) / entry
+    ) * 100
+
+    target = float(meta["target_price"])
+
+    # Activate trailing protection after the initial
+    # 3 ATR profit objective is reached.
+    if highest >= target:
+
+        meta["target_reached"] = True
+        meta["trailing_active"] = True
+
+    # Once activated, trail behind the highest observed price.
+    if meta.get("trailing_active"):
+
+        trailing_stop = (
+            highest - entry_atr * TRAILING_ATR_MULTIPLIER
+        )
+
+        meta["stop_price"] = max(
+            float(meta["stop_price"]),
+            trailing_stop,
+        )
+
+    # Save updated stop and excursion values.
+    updated = dict(st.session_state.position_meta)
+    updated[symbol] = meta
+    st.session_state.position_meta = updated
+
+    stop_price = float(meta["stop_price"])
+
+    # Hard protective stop always takes priority.
+    if price <= stop_price:
+
+        reason = (
+            "Trailing stop triggered"
+            if meta.get("trailing_active")
+            else "Initial ATR stop-loss triggered"
+        )
+
+        if close_paper_position(symbol, price, reason):
+            return f"SELL {symbol}: {reason}"
+
+    # Trend reversal must be confirmed on two closed candles.
+    if confirmed_bearish_reversal(data["frame"]):
+
+        if close_paper_position(
+            symbol,
+            price,
+            "Confirmed bearish EMA reversal",
+        ):
+            return (
+                f"SELL {symbol}: confirmed bearish trend reversal"
+            )
+
+    # No forced exit merely because RSI temporarily falls below 40.
+    return None
+
+
+# ============================================================
+# 11. AUTOMATIC TRADING ENGINE
+# ============================================================
+
+def process_automatic_trades(market_data, risk_fraction):
     messages = []
 
     for symbol, data in market_data.items():
 
         frame = data["frame"]
-        current_price = float(data["price"])
         candle = get_closed_candle(frame)
 
         if candle is None:
@@ -517,69 +748,30 @@ def process_automatic_trades(market_data):
 
         candle_id = str(candle["Timestamp"])
 
-        previous_candle_id = (
+        previous_id = (
             st.session_state.processed_candles.get(symbol)
         )
 
-        already_processed = (
-            previous_candle_id == candle_id
-        )
-
-        # ------------------------------------------
-        # Check existing position exits
-        # ------------------------------------------
+        already_processed = previous_id == candle_id
 
         quantity = float(
             st.session_state.positions.get(symbol, 0.0)
         )
 
-        meta = st.session_state.position_meta.get(symbol)
+        # Manage existing positions on every app rerun.
+        if quantity > 0:
 
-        if quantity > 0 and meta:
+            result = manage_position(symbol, data, candle)
 
-            stop_price = float(meta["stop_price"])
-            target_price = float(meta["target_price"])
+            if result:
+                messages.append(result)
 
-            exit_reason = None
-
-            if current_price <= stop_price:
-                exit_reason = "ATR stop-loss triggered"
-
-            elif current_price >= target_price:
-                exit_reason = "ATR take-profit triggered"
-
-            else:
-                close = float(candle["Close"])
-                ema20 = float(candle["EMA20"])
-                ema50 = float(candle["EMA50"])
-                rsi = float(candle["RSI14"])
-
-                if close < ema20 and ema20 < ema50:
-                    exit_reason = "Bearish EMA trend exit"
-
-                elif rsi < 40:
-                    exit_reason = "Momentum exit: RSI below 40"
-
-            if exit_reason:
-                if close_paper_position(
-                    symbol,
-                    current_price,
-                    exit_reason,
-                ):
-                    messages.append(
-                        f"SELL {symbol}: {exit_reason}"
-                    )
-
-            # Do not re-enter on the same candle after an exit
+            # Do not re-enter on the same candle.
             st.session_state.processed_candles[
                 symbol
             ] = candle_id
 
             continue
-
-        # ------------------------------------------
-        # Prevent duplicate entries per candle
-        # ------------------------------------------
 
         if already_processed:
             continue
@@ -588,36 +780,52 @@ def process_automatic_trades(market_data):
             symbol
         ] = candle_id
 
-        # ------------------------------------------
-        # Automatic entry
-        # ------------------------------------------
+        if not get_entry_signal(frame):
+            continue
 
-        if quantity == 0 and get_entry_signal(frame):
+        open_count = sum(
+            1
+            for qty in st.session_state.positions.values()
+            if float(qty) > 0
+        )
 
-            if open_paper_position(symbol, data, candle):
-                messages.append(
-                    f"BUY {symbol}: automatic bullish entry"
-                )
+        if open_count >= MAX_OPEN_POSITIONS:
+            messages.append(
+                f"SKIP {symbol}: maximum open positions reached"
+            )
+            continue
+
+        if open_paper_position(
+            symbol,
+            data,
+            candle,
+            risk_fraction,
+        ):
+            messages.append(
+                f"BUY {symbol}: automatic paper entry "
+                f"using {risk_fraction * 100:.2f}% risk"
+            )
 
     return messages
 
 
-# ==================================================
-# 9. HEADER
-# ==================================================
+# ============================================================
+# 12. HEADER
+# ============================================================
 
 st.title("Crypto AutoHedge Lab")
 
 st.caption(
-    "Aggressive research strategy · Automatic paper execution "
-    "· No real exchange orders"
+    "Stage 3 · Adaptive holding · Recovery mode · "
+    "Automatic paper execution · No real exchange orders"
 )
 
 st.divider()
 
-# ==================================================
-# 10. SCANNER SETTINGS
-# ==================================================
+
+# ============================================================
+# 13. SCANNER SETTINGS
+# ============================================================
 
 st.header("Market Scanner")
 
@@ -647,19 +855,16 @@ with col3:
 if refresh:
     fetch_scanner_data.clear()
 
-# ==================================================
-# 11. AUTOMATION CONTROL
-# ==================================================
+
+# ============================================================
+# 14. AUTOMATION CONTROL
+# ============================================================
 
 st.subheader("Automatic Paper Execution")
 
 st.session_state.auto_enabled = st.toggle(
     "Enable automatic paper trading",
     value=st.session_state.auto_enabled,
-    help=(
-        "When enabled, qualifying signals can open or close "
-        "virtual positions when the app processes market data."
-    ),
 )
 
 if st.session_state.auto_enabled:
@@ -667,21 +872,20 @@ if st.session_state.auto_enabled:
 else:
     st.warning(
         "Automatic execution is paused. "
-        "Existing virtual positions remain open."
+        "Existing positions remain open."
     )
 
 if not selected_symbols:
     st.warning("Select at least one asset.")
     st.stop()
 
-# ==================================================
-# 12. FETCH DATA
-# ==================================================
+
+# ============================================================
+# 15. FETCH MARKET DATA
+# ============================================================
 
 with st.spinner("Loading public exchange market data..."):
 
-    # Always fetch prices for open positions, even if they are
-    # not currently selected in the Market Scanner.
     symbols_to_fetch = tuple(dict.fromkeys(
         list(selected_symbols)
         + list(st.session_state.positions.keys())
@@ -692,40 +896,116 @@ with st.spinner("Loading public exchange market data..."):
         timeframe,
     )
 
-# ==================================================
-# 13. PROCESS AUTOMATIC TRADES
-# ==================================================
+
+# ============================================================
+# 16. DAILY RISK AND RECOVERY MODE
+# ============================================================
+
+equity_before = calculate_equity(market_data)
+
+equity, daily_pct, current_risk = update_daily_risk(
+    market_data
+)
+
+st.divider()
+st.header("Portfolio Risk Control")
+
+r1, r2, r3, r4 = st.columns(4)
+
+r1.metric(
+    "Daily Equity Change",
+    f"{daily_pct * 100:+.2f}%",
+)
+
+r2.metric(
+    "Current Risk per Trade",
+    f"{current_risk * 100:.2f}%",
+)
+
+r3.metric(
+    "Daily Loss Trigger",
+    "-4.00%",
+)
+
+r4.metric(
+    "Open Positions",
+    sum(
+        1
+        for qty in st.session_state.positions.values()
+        if float(qty) > 0
+    ),
+)
+
+if st.session_state.recovery_mode:
+
+    st.warning(
+        "RECOVERY MODE ACTIVE: Daily drawdown reached 4%. "
+        "New qualifying paper trades use 0.5% risk per trade. "
+        "Existing positions remain managed by their stops and "
+        "confirmed trend exits. Trading risk returns to 2% only "
+        "when daily starting equity is recovered."
+    )
+
+else:
+
+    st.success(
+        "NORMAL MODE: Standard 2% virtual risk per trade."
+    )
+
+if timeframe != "15m":
+
+    st.warning(
+        "Automatic entries are configured for 15m candles only. "
+        "Switch to 15m to enable the automatic trading engine."
+    )
+
+
+# ============================================================
+# 17. PROCESS AUTOMATIC TRADES
+# ============================================================
 
 execution_messages = []
 
-if st.session_state.auto_enabled and timeframe == "15m":
+if (
+    st.session_state.auto_enabled
+    and timeframe == "15m"
+):
 
     execution_messages = process_automatic_trades(
-        market_data
+        market_data,
+        current_risk,
     )
 
-elif st.session_state.auto_enabled and timeframe != "15m":
+for message in execution_messages:
 
-    st.warning(
-        "Automatic execution is configured for 15m only. "
-        "Change the timeframe to 15m to enable automatic trades."
-    )
+    if message.startswith("SELL"):
+        st.warning(message)
 
-if execution_messages:
+    elif message.startswith("SKIP"):
+        st.info(message)
 
-    for message in execution_messages:
+    else:
         st.success(message)
 
-# ==================================================
-# 14. MARKET OVERVIEW
-# ==================================================
+
+# Recalculate after any paper trades.
+equity = calculate_equity(market_data)
+
+equity, daily_pct, current_risk = update_daily_risk(
+    market_data
+)
+
+
+# ============================================================
+# 18. MARKET OVERVIEW
+# ============================================================
 
 st.divider()
 st.header("Market Overview")
 
 if market_data:
 
-    scanner_rows = []
+    rows = []
 
     for symbol, data in market_data.items():
 
@@ -734,7 +1014,7 @@ if market_data:
         if candle is None:
             continue
 
-        scanner_rows.append({
+        rows.append({
             "Symbol": symbol,
             "Price (USDT)": data["price"],
             "24h Change (%)": data["change"],
@@ -746,20 +1026,15 @@ if market_data:
             "Exchange": data["exchange"],
         })
 
-    if scanner_rows:
-
+    if rows:
         st.dataframe(
-            pd.DataFrame(scanner_rows),
+            pd.DataFrame(rows),
             use_container_width=True,
             hide_index=True,
         )
 
 else:
-
-    st.warning(
-        "No market data available. "
-        "The exchanges may be temporarily unavailable."
-    )
+    st.warning("No market data currently available.")
 
 if market_errors:
 
@@ -768,9 +1043,10 @@ if market_errors:
         for symbol, error in market_errors.items():
             st.write(f"**{symbol}:** {error}")
 
-# ==================================================
-# 15. ASSET ANALYSIS
-# ==================================================
+
+# ============================================================
+# 19. ASSET ANALYSIS
+# ============================================================
 
 st.divider()
 st.header("Asset Analysis")
@@ -784,8 +1060,8 @@ if available_symbols:
         available_symbols,
     )
 
-    asset_data = market_data[selected_asset]
-    frame = asset_data["frame"]
+    asset = market_data[selected_asset]
+    frame = asset["frame"]
     candle = get_closed_candle(frame)
 
     if candle is not None:
@@ -794,7 +1070,7 @@ if available_symbols:
 
         c1.metric(
             "Current Price",
-            f"${asset_data['price']:,.4f}",
+            f"${asset['price']:,.4f}",
         )
 
         c2.metric(
@@ -822,14 +1098,10 @@ if available_symbols:
             ]
         )
 
-        st.caption(
-            "Indicators use the last completed candle. "
-            "The displayed price is the latest available ticker price."
-        )
 
-# ==================================================
-# 16. ACCOUNT OVERVIEW
-# ==================================================
+# ============================================================
+# 20. ACCOUNT OVERVIEW
+# ============================================================
 
 st.divider()
 st.header("Account Overview")
@@ -839,7 +1111,7 @@ equity = calculate_equity(market_data)
 a1, a2, a3, a4 = st.columns(4)
 
 a1.metric(
-    "Starting Cash",
+    "Starting Capital",
     f"${STARTING_CASH:,.2f}",
 )
 
@@ -854,14 +1126,18 @@ a3.metric(
 )
 
 a4.metric(
-    "Paper Trades",
-    len(st.session_state.trades),
+    "Closed Paper Trades",
+    sum(
+        1
+        for trade in st.session_state.trades
+        if trade.get("Side") == "SELL"
+    ),
 )
 
 
-# ==================================================
-# 17. RISK MONITOR
-# ==================================================
+# ============================================================
+# 21. RISK MONITOR AND POSITION RECOVERY
+# ============================================================
 
 st.divider()
 st.header("Risk Monitor")
@@ -875,8 +1151,9 @@ open_positions = {
 if open_positions:
 
     st.caption(
-        "Live position values use the latest available public ticker price. "
-        "P/L is estimated and excludes future exit fees and slippage."
+        "P/L is estimated from public ticker prices and excludes "
+        "future exit fees and slippage. Recovery calculations are "
+        "session-based."
     )
 
     for symbol, quantity in open_positions.items():
@@ -884,175 +1161,159 @@ if open_positions:
         data = market_data.get(symbol)
         meta = st.session_state.position_meta.get(symbol, {})
 
-        # ------------------------------------------
-        # RECOVER MISSING POSITION METADATA
-        # ------------------------------------------
-
-        missing_metadata = any(
+        missing = any(
             meta.get(key) is None
-            for key in ["entry_price", "stop_price", "target_price"]
+            for key in [
+                "entry_price",
+                "stop_price",
+                "target_price",
+                "entry_atr",
+            ]
         )
 
-        if missing_metadata:
+        if missing:
 
             st.warning(
-                f"{symbol} is missing saved entry or risk-management details."
+                f"{symbol} needs its original paper-trade "
+                "entry and risk details."
             )
 
-            # Use the known BTC entry price.
-            # Other positions may use their most recent recorded BUY price.
-            default_entry = 0.0
+            default_entry = (
+                59244.10 if symbol == "BTC/USDT" else 0.0
+            )
 
-            if symbol == "BTC/USDT":
-                default_entry = 59244.10
+            previous_buys = [
+                trade
+                for trade in st.session_state.trades
+                if trade.get("Symbol") == symbol
+                and trade.get("Side") == "BUY"
+            ]
 
-            else:
-                previous_buys = [
-                    trade for trade in st.session_state.trades
-                    if trade.get("Symbol") == symbol
-                    and trade.get("Side") == "BUY"
-                ]
-
-                if previous_buys:
-                    default_entry = float(
-                        previous_buys[0].get("Price (USDT)", 0.0)
-                    )
+            if previous_buys and symbol != "BTC/USDT":
+                default_entry = float(
+                    previous_buys[0].get("Price (USDT)", 0)
+                )
 
             with st.form(key=f"recover_{symbol}"):
 
-                st.subheader(f"Recover {symbol} position")
-
                 recovery_entry = st.number_input(
-                    "Original paper-trade entry price (USDT)",
+                    "Original entry price (USDT)",
                     min_value=0.0,
                     value=float(default_entry),
                     step=0.01,
                     format="%.8f",
-                    key=f"recovery_entry_{symbol}",
                 )
 
-                st.caption(
-                    f"Risk levels will use ATR14 from the selected "
-                    f"{timeframe} timeframe. For your Stage 2 strategy, "
-                    "15m is recommended."
-                )
-
-                recover_button = st.form_submit_button(
+                submitted = st.form_submit_button(
                     "Save entry and calculate risk levels",
                     use_container_width=True,
                 )
 
-                if recover_button:
+                if submitted:
 
                     if recovery_entry <= 0:
-                        st.error("Enter a valid original entry price.")
+                        st.error("Enter a valid entry price.")
 
                     elif data is None:
-                        st.error(
-                            "Market data is unavailable. Refresh and try again."
-                        )
+                        st.error("Market data is unavailable.")
 
                     else:
+
                         recovery_candle = get_closed_candle(
                             data["frame"]
                         )
 
-                        if (
-                            recovery_candle is None
-                            or pd.isna(recovery_candle["ATR14"])
-                            or float(recovery_candle["ATR14"]) <= 0
-                        ):
-                            st.error(
-                                "ATR14 is unavailable. "
-                                "Try refreshing market data."
-                            )
+                        atr = (
+                            float(recovery_candle["ATR14"])
+                            if recovery_candle is not None
+                            and pd.notna(recovery_candle["ATR14"])
+                            else 0.0
+                        )
+
+                        if atr <= 0:
+                            st.error("ATR14 is unavailable.")
 
                         else:
-                            entry_price = float(recovery_entry)
-                            atr = float(recovery_candle["ATR14"])
 
-                            stop_price = (
-                                entry_price
-                                - atr * STOP_ATR_MULTIPLIER
+                            entry = float(recovery_entry)
+                            stop = (
+                                entry - atr * STOP_ATR_MULTIPLIER
+                            )
+                            target = (
+                                entry + atr * TARGET_ATR_MULTIPLIER
                             )
 
-                            target_price = (
-                                entry_price
-                                + atr * TARGET_ATR_MULTIPLIER
-                            )
-
-                            if stop_price <= 0:
-                                st.error(
-                                    "Calculated stop-loss is invalid."
-                                )
+                            if stop <= 0:
+                                st.error("Invalid calculated stop.")
 
                             else:
-                                updated_meta = dict(
+
+                                recovered = dict(
                                     st.session_state.position_meta
                                 )
 
-                                updated_meta[symbol] = {
-                                    "entry_price": entry_price,
-                                    "stop_price": stop_price,
-                                    "target_price": target_price,
+                                recovered[symbol] = {
+                                    "entry_price": entry,
+                                    "stop_price": stop,
+                                    "initial_stop_price": stop,
+                                    "target_price": target,
                                     "entry_atr": atr,
                                     "risk_amount": (
-                                        quantity * (entry_price - stop_price)
+                                        quantity * (entry - stop)
                                     ),
+                                    "entry_fee": 0.0,
                                     "entry_time": datetime.now(
                                         timezone.utc
                                     ).isoformat(timespec="seconds"),
+                                    "highest_price": max(
+                                        entry, data["price"]
+                                    ),
+                                    "lowest_price": min(
+                                        entry, data["price"]
+                                    ),
+                                    "mfe_pct": 0.0,
+                                    "mae_pct": 0.0,
+                                    "trailing_active": False,
+                                    "target_reached": False,
+                                    "entry_rsi": None,
+                                    "entry_ema20": None,
+                                    "entry_ema50": None,
+                                    "entry_signal": "Recovered legacy position",
                                     "recovered": True,
                                 }
 
-                                st.session_state.position_meta = (
-                                    updated_meta
-                                )
+                                st.session_state.position_meta = recovered
 
                                 st.success(
-                                    f"{symbol} risk details recovered successfully."
+                                    f"{symbol} metadata saved."
                                 )
 
-            # Reload metadata after recovery form submission
-            meta = st.session_state.position_meta.get(symbol, {})
+                                st.rerun()
 
-        # ------------------------------------------
-        # DISPLAY POSITION DETAILS
-        # ------------------------------------------
+        # Reload metadata after any recovery.
+        meta = st.session_state.position_meta.get(symbol, {})
 
         entry = meta.get("entry_price")
-        stop_price = meta.get("stop_price")
-        target_price = meta.get("target_price")
+        stop = meta.get("stop_price")
+        target = meta.get("target_price")
 
         entry = float(entry) if entry is not None else None
-        stop_price = (
-            float(stop_price) if stop_price is not None else None
-        )
-        target_price = (
-            float(target_price) if target_price is not None else None
-        )
+        stop = float(stop) if stop is not None else None
+        target = float(target) if target is not None else None
 
-        current_price = (
+        current = (
             float(data["price"])
-            if data and data.get("price") is not None
+            if data is not None
             else None
         )
 
-        unrealised_pnl = None
-        unrealised_pct = None
+        pnl = None
+        pnl_pct = None
 
-        if (
-            entry is not None
-            and entry > 0
-            and current_price is not None
-        ):
-            unrealised_pnl = (
-                current_price - entry
-            ) * quantity
+        if entry is not None and current is not None and entry > 0:
 
-            unrealised_pct = (
-                (current_price - entry) / entry
-            ) * 100
+            pnl = (current - entry) * quantity
+            pnl_pct = ((current - entry) / entry) * 100
 
         with st.container(border=True):
 
@@ -1067,100 +1328,269 @@ if open_positions:
 
             c2.metric(
                 "Current Price",
-                f"${current_price:,.6f}"
-                if current_price is not None else "Unavailable",
+                f"${current:,.6f}" if current is not None else "Unavailable",
             )
 
             c3.metric(
-                "Quantity Held",
+                "Quantity",
                 f"{quantity:.8f}",
             )
 
             c4, c5, c6 = st.columns(3)
 
             c4.metric(
-                "Stop Loss",
-                f"${stop_price:,.6f}"
-                if stop_price is not None else "Not set",
+                "Current Stop Loss",
+                f"${stop:,.6f}" if stop is not None else "Not set",
             )
 
             c5.metric(
-                "Take Profit",
-                f"${target_price:,.6f}"
-                if target_price is not None else "Not set",
+                "Initial Take Profit",
+                f"${target:,.6f}" if target is not None else "Not set",
             )
 
-            if unrealised_pnl is not None:
+            if pnl is not None:
 
                 c6.metric(
                     "Unrealized P/L",
-                    f"${unrealised_pnl:+,.4f} USDT",
-                    delta=f"{unrealised_pct:+.2f}%",
+                    f"${pnl:+,.4f}",
+                    delta=f"{pnl_pct:+.2f}%",
                 )
 
             else:
+                c6.metric("Unrealized P/L", "Unavailable")
 
-                c6.metric(
-                    "Unrealized P/L",
-                    "Unavailable",
+            if meta:
+
+                trailing = meta.get("trailing_active", False)
+                target_reached = meta.get("target_reached", False)
+
+                st.write(
+                    f"**Trailing protection:** "
+                    f"{'Active' if trailing else 'Not active'}"
                 )
 
-            if meta.get("recovered"):
-                st.caption(
-                    "Position metadata recovered manually. "
-                    "Entry price was supplied from your paper-trade record."
+                st.write(
+                    f"**Initial target reached:** "
+                    f"{'Yes' if target_reached else 'No'}"
                 )
 
-            if (
-                entry is None
-                or stop_price is None
-                or target_price is None
-            ):
-                st.warning(
-                    "Some risk details are still missing. "
-                    "Use the recovery form above."
-                )
+                entry_time = meta.get("entry_time")
+
+                if entry_time:
+                    try:
+                        started = datetime.fromisoformat(entry_time)
+                        minutes = max(
+                            0,
+                            (
+                                datetime.now(timezone.utc) - started
+                            ).total_seconds() / 60,
+                        )
+
+                        st.write(
+                            f"**Holding duration:** "
+                            f"{minutes / 60:.1f} hours"
+                        )
+                    except Exception:
+                        pass
+
+                if meta.get("mfe_pct") is not None:
+                    st.write(
+                        f"**Maximum favourable movement:** "
+                        f"{meta['mfe_pct']:.2f}%"
+                    )
+
+                if meta.get("mae_pct") is not None:
+                    st.write(
+                        f"**Maximum adverse movement:** "
+                        f"{meta['mae_pct']:.2f}%"
+                    )
+
+                if meta.get("recovered"):
+                    st.caption(
+                        "Recovered legacy position. "
+                        "Original entry supplied manually."
+                    )
 
 else:
 
     st.info("No open virtual positions.")
 
 
-# ==================================================
-# 18. PAPER TRADE HISTORY
+# ============================================================
+# 22. PERFORMANCE ANALYSIS
+# ============================================================
+
+st.divider()
+st.header("Performance Analysis")
+
+closed_trades = [
+    trade
+    for trade in st.session_state.trades
+    if trade.get("Side") == "SELL"
+    and trade.get("Net P/L (USDT)") is not None
+]
+
+if closed_trades:
+
+    results = [
+        float(trade["Net P/L (USDT)"])
+        for trade in closed_trades
+    ]
+
+    wins = [value for value in results if value > 0]
+    losses = [value for value in results if value < 0]
+
+    win_rate = len(wins) / len(results) * 100
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else None
+    )
+
+    total_realized = sum(results)
+
+    p1, p2, p3, p4 = st.columns(4)
+
+    p1.metric(
+        "Realized P/L",
+        f"${total_realized:+,.2f}",
+    )
+
+    p2.metric(
+        "Win Rate",
+        f"{win_rate:.1f}%",
+    )
+
+    p3.metric(
+        "Profit Factor",
+        f"{profit_factor:.2f}"
+        if profit_factor is not None else "N/A",
+    )
+
+    p4.metric(
+        "Closed Trades",
+        len(results),
+    )
+
+    st.caption(
+        "Performance statistics use recorded closed paper trades. "
+        "Recovered legacy positions may have estimated historical fees."
+    )
+
+else:
+
+    st.info(
+        "Performance statistics will appear after your first "
+        "completed paper trade."
+    )
+
+
+# ============================================================
+# 23. TRADE HISTORY AND EXPORT
+# ============================================================
 
 st.divider()
 st.header("Paper Trade History")
 
 if st.session_state.trades:
 
+    trade_frame = pd.DataFrame(
+        st.session_state.trades
+    )
+
     st.dataframe(
-        pd.DataFrame(st.session_state.trades),
+        trade_frame,
         use_container_width=True,
         hide_index=True,
+    )
+
+    csv_data = trade_frame.to_csv(index=False)
+
+    st.download_button(
+        "Download paper trade history (CSV)",
+        data=csv_data,
+        file_name="crypto_autohedge_paper_trades.csv",
+        mime="text/csv",
     )
 
 else:
 
     st.caption("No paper trades recorded yet.")
 
-# ==================================================
-# 19. STRATEGY SETTINGS
-# ==================================================
+
+# ============================================================
+# 24. EQUITY TRACKING
+# ============================================================
 
 st.divider()
-st.header("Strategy Configuration")
+st.header("Equity Tracking")
+
+history = list(st.session_state.equity_history)
+
+snapshot_time = datetime.now(timezone.utc).isoformat(
+    timespec="seconds"
+)
+
+# Keep one snapshot per minute to avoid duplicate rerun entries.
+if (
+    not history
+    or history[-1].get("Time") is None
+    or (
+        datetime.now(timezone.utc)
+        - datetime.fromisoformat(history[-1]["Time"])
+    ).total_seconds() >= 60
+):
+
+    history.append({
+        "Time": snapshot_time,
+        "Equity": equity,
+    })
+
+    history = history[-2000:]
+
+    st.session_state.equity_history = history
+
+if history:
+
+    equity_frame = pd.DataFrame(history)
+
+    st.line_chart(
+        equity_frame.set_index("Time")["Equity"]
+    )
+
+    st.caption(
+        "Equity history is recorded during active app sessions. "
+        "It is not a permanent database."
+    )
+
+
+# ============================================================
+# 25. STRATEGY CONFIGURATION
+# ============================================================
+
+st.divider()
+st.header("Stage 3 Strategy Configuration")
 
 settings = {
-    "Strategy": "Aggressive",
+    "Strategy": "Aggressive adaptive",
     "Execution": "Automatic paper trading",
-    "Risk per trade": "2% of estimated equity",
-    "Stop loss": "1.5 × ATR14",
-    "Take profit": "3 × ATR14",
-    "Risk/reward target": "1:2",
-    "Maximum allocation": "25% of estimated equity",
+    "Normal risk": "2% per trade",
+    "Daily recovery trigger": "-4% of daily starting equity",
+    "Recovery risk": "0.5% per trade",
+    "Recovery objective": "Recover daily starting equity",
+    "Initial stop loss": "1.5 × ATR14",
+    "Initial profit objective": "3 × ATR14",
+    "Trailing stop": "1.5 × entry ATR below highest price",
+    "Trend exit": "Two confirmed bearish completed candles",
+    "Maximum positions": "3",
+    "Maximum allocation": "25% per position",
     "Simulated fee": "0.1% per side",
     "Entry timeframe": "15m",
+    "Trading direction": "Long only",
 }
 
 st.dataframe(
@@ -1172,15 +1602,19 @@ st.dataframe(
     hide_index=True,
 )
 
-# ==================================================
-# 20. FOOTER
-# ==================================================
+
+# ============================================================
+# 26. FOOTER
+# ============================================================
 
 st.caption(
     "Educational paper-trading simulator only. "
-    "Signals are rule-based and are not predictions. "
-    "Public exchange data can be delayed or unavailable. "
-    "Simulated fills do not represent guaranteed execution. "
-    "Fees are approximated; slippage and funding are not included. "
-    "Virtual balances are session-based and may reset."
+    "No real exchange orders or wallet access. "
+    "Public exchange data may be delayed or unavailable. "
+    "Automatic processing occurs only when the Streamlit app reruns. "
+    "Stops cannot guarantee execution prices. "
+    "Simulated fees are estimates; slippage and funding are excluded. "
+    "Positions, daily risk state, and history are session-based "
+    "and may reset when the session restarts. "
+    "This system does not guarantee recovery or profitability."
 )
