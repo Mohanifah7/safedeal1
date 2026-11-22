@@ -680,8 +680,15 @@ if not selected_symbols:
 
 with st.spinner("Loading public exchange market data..."):
 
+    # Always fetch prices for open positions, even if they are
+    # not currently selected in the Market Scanner.
+    symbols_to_fetch = tuple(dict.fromkeys(
+        list(selected_symbols)
+        + list(st.session_state.positions.keys())
+    ))
+
     market_data, market_errors = fetch_scanner_data(
-        tuple(selected_symbols),
+        symbols_to_fetch,
         timeframe,
     )
 
@@ -852,55 +859,108 @@ a4.metric(
 )
 
 # ==================================================
+# ==================================================
 # 17. RISK MONITOR
 # ==================================================
 
 st.divider()
 st.header("Risk Monitor")
 
-position_rows = []
+open_positions = {
+    symbol: float(quantity)
+    for symbol, quantity in st.session_state.positions.items()
+    if float(quantity) > 0
+}
 
-for symbol, quantity in st.session_state.positions.items():
+if open_positions:
 
-    data = market_data.get(symbol)
-    meta = st.session_state.position_meta.get(symbol, {})
-
-    price = (
-        float(data["price"])
-        if data
-        else float(meta.get("entry_price", 0))
+    st.caption(
+        "Live position values use the latest available public ticker price. "
+        "P/L is estimated and excludes any future exit fee or slippage."
     )
 
-    entry = float(meta.get("entry_price", 0))
+    for symbol, quantity in open_positions.items():
 
-    position_rows.append({
-        "Symbol": symbol,
-        "Quantity": quantity,
-        "Entry Price": entry if entry else None,
-        "Current Price": price,
-        "Stop Loss": meta.get("stop_price"),
-        "Take Profit": meta.get("target_price"),
-        "Market Value": quantity * price,
-        "Unrealised P/L": (
-            (price - entry) * quantity
-            if entry
-            else None
-        ),
-    })
+        data = market_data.get(symbol)
+        meta = st.session_state.position_meta.get(symbol, {})
 
-if position_rows:
+        entry = meta.get("entry_price")
+        entry = float(entry) if entry is not None else None
 
-    st.dataframe(
-        pd.DataFrame(position_rows),
-        use_container_width=True,
-        hide_index=True,
-    )
+        current_price = (
+            float(data["price"])
+            if data and data.get("price") is not None
+            else entry
+        )
+
+        stop_price = meta.get("stop_price")
+        target_price = meta.get("target_price")
+
+        unrealised_pnl = None
+        unrealised_pct = None
+
+        if entry is not None and entry > 0 and current_price is not None:
+            unrealised_pnl = (current_price - entry) * quantity
+            unrealised_pct = ((current_price - entry) / entry) * 100
+
+        with st.container(border=True):
+
+            st.subheader(f"🪙 {symbol}")
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric(
+                "Entry Price",
+                f"${entry:,.6f}" if entry is not None else "Unavailable",
+            )
+
+            c2.metric(
+                "Current Price",
+                f"${current_price:,.6f}" if current_price is not None else "Unavailable",
+            )
+
+            c3.metric(
+                "Quantity Held",
+                f"{quantity:.8f}",
+            )
+
+            c4, c5, c6 = st.columns(3)
+
+            c4.metric(
+                "Stop Loss",
+                f"${float(stop_price):,.6f}" if stop_price is not None else "Not set",
+            )
+
+            c5.metric(
+                "Take Profit",
+                f"${float(target_price):,.6f}" if target_price is not None else "Not set",
+            )
+
+            if unrealised_pnl is not None:
+                pnl_delta = f"{unrealised_pct:+.2f}%"
+                c6.metric(
+                    "Unrealized P/L",
+                    f"${unrealised_pnl:+,.2f} USDT",
+                    delta=pnl_delta,
+                )
+            else:
+                c6.metric(
+                    "Unrealized P/L",
+                    "Unavailable",
+                    help="This position has no saved entry price. Its P/L cannot be calculated accurately.",
+                )
+
+            if entry is None or stop_price is None or target_price is None:
+                st.warning(
+                    "This position is missing saved entry/stop/target details. "
+                    "It may be an older position created before automatic risk metadata was added. "
+                    "The app will not invent these values."
+                )
 
 else:
 
     st.info("No open virtual positions.")
 
-# ==================================================
 # 18. PAPER TRADE HISTORY
 # ==================================================
 
