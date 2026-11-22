@@ -21,32 +21,7 @@ if "positions" not in st.session_state:
 if "trades" not in st.session_state:
     st.session_state.trades = []
 
-@st.cache_resource
-def exchange_client():
-    # Public market data only; no API keys or wallet secrets.
-    return ccxt.binance({"enableRateLimit": True, "timeout": 10000})
-
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_prices():
-    client = exchange_client()
-    results = []
-    for symbol in SYMBOLS:
-        try:
-            ticker = client.fetch_ticker(symbol)
-            results.append({
-                "Symbol": symbol,
-                "Last price (USDT)": float(ticker.get("last") or 0),
-                "24h change (%)": float(ticker.get("percentage") or 0),
-                "24h quote volume": float(ticker.get("quoteVolume") or 0),
-            })
-        except Exception as exc:
-            results.append({"Symbol": symbol, "Error": str(exc)[:160]})
-    return results
-
-try:
-    market = fetch_prices()
-except Exception as exc:
-    market = [{"Symbol": "Market data", "Error": str(exc)[:200]}]
+@st.cache_re
 
 market_df = pd.DataFrame(market)
 if "Last price (USDT)" in market_df.columns:
