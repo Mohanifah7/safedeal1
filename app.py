@@ -859,7 +859,6 @@ a4.metric(
 )
 
 # ==================================================
-# ==================================================
 # 17. RISK MONITOR
 # ==================================================
 
@@ -961,8 +960,8 @@ else:
 
     st.info("No open virtual positions.")
 
-# 18. PAPER TRADE HISTORY
 # ==================================================
+# 18. PAPER TRADE HISTORY
 
 st.divider()
 st.header("Paper Trade History")
