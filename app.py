@@ -858,6 +858,7 @@ a4.metric(
     len(st.session_state.trades),
 )
 
+
 # ==================================================
 # 17. RISK MONITOR
 # ==================================================
@@ -875,7 +876,7 @@ if open_positions:
 
     st.caption(
         "Live position values use the latest available public ticker price. "
-        "P/L is estimated and excludes any future exit fee or slippage."
+        "P/L is estimated and excludes future exit fees and slippage."
     )
 
     for symbol, quantity in open_positions.items():
@@ -883,24 +884,175 @@ if open_positions:
         data = market_data.get(symbol)
         meta = st.session_state.position_meta.get(symbol, {})
 
+        # ------------------------------------------
+        # RECOVER MISSING POSITION METADATA
+        # ------------------------------------------
+
+        missing_metadata = any(
+            meta.get(key) is None
+            for key in ["entry_price", "stop_price", "target_price"]
+        )
+
+        if missing_metadata:
+
+            st.warning(
+                f"{symbol} is missing saved entry or risk-management details."
+            )
+
+            # Use the known BTC entry price.
+            # Other positions may use their most recent recorded BUY price.
+            default_entry = 0.0
+
+            if symbol == "BTC/USDT":
+                default_entry = 59244.10
+
+            else:
+                previous_buys = [
+                    trade for trade in st.session_state.trades
+                    if trade.get("Symbol") == symbol
+                    and trade.get("Side") == "BUY"
+                ]
+
+                if previous_buys:
+                    default_entry = float(
+                        previous_buys[0].get("Price (USDT)", 0.0)
+                    )
+
+            with st.form(key=f"recover_{symbol}"):
+
+                st.subheader(f"Recover {symbol} position")
+
+                recovery_entry = st.number_input(
+                    "Original paper-trade entry price (USDT)",
+                    min_value=0.0,
+                    value=float(default_entry),
+                    step=0.01,
+                    format="%.8f",
+                    key=f"recovery_entry_{symbol}",
+                )
+
+                st.caption(
+                    f"Risk levels will use ATR14 from the selected "
+                    f"{timeframe} timeframe. For your Stage 2 strategy, "
+                    "15m is recommended."
+                )
+
+                recover_button = st.form_submit_button(
+                    "Save entry and calculate risk levels",
+                    use_container_width=True,
+                )
+
+                if recover_button:
+
+                    if recovery_entry <= 0:
+                        st.error("Enter a valid original entry price.")
+
+                    elif data is None:
+                        st.error(
+                            "Market data is unavailable. Refresh and try again."
+                        )
+
+                    else:
+                        recovery_candle = get_closed_candle(
+                            data["frame"]
+                        )
+
+                        if (
+                            recovery_candle is None
+                            or pd.isna(recovery_candle["ATR14"])
+                            or float(recovery_candle["ATR14"]) <= 0
+                        ):
+                            st.error(
+                                "ATR14 is unavailable. "
+                                "Try refreshing market data."
+                            )
+
+                        else:
+                            entry_price = float(recovery_entry)
+                            atr = float(recovery_candle["ATR14"])
+
+                            stop_price = (
+                                entry_price
+                                - atr * STOP_ATR_MULTIPLIER
+                            )
+
+                            target_price = (
+                                entry_price
+                                + atr * TARGET_ATR_MULTIPLIER
+                            )
+
+                            if stop_price <= 0:
+                                st.error(
+                                    "Calculated stop-loss is invalid."
+                                )
+
+                            else:
+                                updated_meta = dict(
+                                    st.session_state.position_meta
+                                )
+
+                                updated_meta[symbol] = {
+                                    "entry_price": entry_price,
+                                    "stop_price": stop_price,
+                                    "target_price": target_price,
+                                    "entry_atr": atr,
+                                    "risk_amount": (
+                                        quantity * (entry_price - stop_price)
+                                    ),
+                                    "entry_time": datetime.now(
+                                        timezone.utc
+                                    ).isoformat(timespec="seconds"),
+                                    "recovered": True,
+                                }
+
+                                st.session_state.position_meta = (
+                                    updated_meta
+                                )
+
+                                st.success(
+                                    f"{symbol} risk details recovered successfully."
+                                )
+
+            # Reload metadata after recovery form submission
+            meta = st.session_state.position_meta.get(symbol, {})
+
+        # ------------------------------------------
+        # DISPLAY POSITION DETAILS
+        # ------------------------------------------
+
         entry = meta.get("entry_price")
+        stop_price = meta.get("stop_price")
+        target_price = meta.get("target_price")
+
         entry = float(entry) if entry is not None else None
+        stop_price = (
+            float(stop_price) if stop_price is not None else None
+        )
+        target_price = (
+            float(target_price) if target_price is not None else None
+        )
 
         current_price = (
             float(data["price"])
             if data and data.get("price") is not None
-            else entry
+            else None
         )
-
-        stop_price = meta.get("stop_price")
-        target_price = meta.get("target_price")
 
         unrealised_pnl = None
         unrealised_pct = None
 
-        if entry is not None and entry > 0 and current_price is not None:
-            unrealised_pnl = (current_price - entry) * quantity
-            unrealised_pct = ((current_price - entry) / entry) * 100
+        if (
+            entry is not None
+            and entry > 0
+            and current_price is not None
+        ):
+            unrealised_pnl = (
+                current_price - entry
+            ) * quantity
+
+            unrealised_pct = (
+                (current_price - entry) / entry
+            ) * 100
 
         with st.container(border=True):
 
@@ -915,7 +1067,8 @@ if open_positions:
 
             c2.metric(
                 "Current Price",
-                f"${current_price:,.6f}" if current_price is not None else "Unavailable",
+                f"${current_price:,.6f}"
+                if current_price is not None else "Unavailable",
             )
 
             c3.metric(
@@ -927,38 +1080,51 @@ if open_positions:
 
             c4.metric(
                 "Stop Loss",
-                f"${float(stop_price):,.6f}" if stop_price is not None else "Not set",
+                f"${stop_price:,.6f}"
+                if stop_price is not None else "Not set",
             )
 
             c5.metric(
                 "Take Profit",
-                f"${float(target_price):,.6f}" if target_price is not None else "Not set",
+                f"${target_price:,.6f}"
+                if target_price is not None else "Not set",
             )
 
             if unrealised_pnl is not None:
-                pnl_delta = f"{unrealised_pct:+.2f}%"
+
                 c6.metric(
                     "Unrealized P/L",
-                    f"${unrealised_pnl:+,.2f} USDT",
-                    delta=pnl_delta,
+                    f"${unrealised_pnl:+,.4f} USDT",
+                    delta=f"{unrealised_pct:+.2f}%",
                 )
+
             else:
+
                 c6.metric(
                     "Unrealized P/L",
                     "Unavailable",
-                    help="This position has no saved entry price. Its P/L cannot be calculated accurately.",
                 )
 
-            if entry is None or stop_price is None or target_price is None:
+            if meta.get("recovered"):
+                st.caption(
+                    "Position metadata recovered manually. "
+                    "Entry price was supplied from your paper-trade record."
+                )
+
+            if (
+                entry is None
+                or stop_price is None
+                or target_price is None
+            ):
                 st.warning(
-                    "This position is missing saved entry/stop/target details. "
-                    "It may be an older position created before automatic risk metadata was added. "
-                    "The app will not invent these values."
+                    "Some risk details are still missing. "
+                    "Use the recovery form above."
                 )
 
 else:
 
     st.info("No open virtual positions.")
+
 
 # ==================================================
 # 18. PAPER TRADE HISTORY
